@@ -1,0 +1,14 @@
+services:
+  augment-mcp:
+    build: .
+    image: augment-mcp:latest
+    environment:
+      AUGMENT_MCP_HOST: 0.0.0.0
+      AUGMENT_MCP_PORT: 503
+    env_file:
+      - .env
+    ports:
+      - "503:503"
+    volumes:
+      - /opt/stacks:/opt/stacks
+    restart: unless-stopped
