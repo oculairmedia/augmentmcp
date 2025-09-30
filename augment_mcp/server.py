@@ -534,7 +534,7 @@ def refactor_code_prompt(
     file_path: str,
     goals: list[str] | None = None,
     preserve_behavior: bool = True,
-) -> list[dict[str, Any]]:
+) -> list[Message]:
     """Prompt template for structured refactoring guidance."""
 
     goal_catalog = {
