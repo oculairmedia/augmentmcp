@@ -17,13 +17,19 @@ from fastmcp.exceptions import ToolError
 
 from augment_mcp.auggie import run_auggie
 from augment_mcp.server import (
+    analyze_performance_prompt,
+    api_design_review_prompt,
     augment_configure,
     augment_custom_command,
     augment_list_commands,
     augment_review,
     generate_tests_prompt,
+    get_capabilities,
+    get_command_details,
     get_custom_commands,
+    get_index_status,
     get_workspace_settings,
+    get_workspace_tree,
     refactor_code_prompt,
     security_review_prompt,
 )
@@ -175,6 +181,78 @@ class AugmentServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertSetEqual(names, {"security-review", "lint"})
         self.assertSetEqual(scopes, {"workspace", "user"})
 
+    async def test_workspace_tree_resource_truncates_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "a").mkdir()
+            (root / "a" / "nested").mkdir()
+            (root / "a" / "nested" / "file.txt").write_text("hi", encoding="utf-8")
+            (root / "b.txt").write_text("hello", encoding="utf-8")
+
+            tree = await get_workspace_tree.read(
+                {"workspace_path": str(root), "max_depth": 1}
+            )
+
+        self.assertEqual(tree["type"], "directory")
+        child_names = {child["name"] for child in tree.get("children", [])}
+        self.assertIn("a", child_names)
+        self.assertIn("b.txt", child_names)
+        a_node = next(child for child in tree["children"] if child["name"] == "a")
+        self.assertTrue(a_node.get("truncated"))
+
+    async def test_index_status_resource_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = await get_index_status.read({"workspace_path": tmp_dir})
+
+        self.assertFalse(result["indexed"])
+        self.assertIn("status_file", result)
+
+    async def test_index_status_resource_reads_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            status_file = workspace / ".augment" / "index" / "status.json"
+            status_file.parent.mkdir(parents=True, exist_ok=True)
+            status_file.write_text(
+                json.dumps({"indexed": True, "documents": 42}), encoding="utf-8"
+            )
+
+            result = await get_index_status.read({"workspace_path": str(workspace)})
+
+        self.assertTrue(result["indexed"])
+        self.assertEqual(result["documents"], 42)
+
+    async def test_command_details_resource_prefers_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "workspace"
+            workspace.mkdir()
+            workspace_cmd = workspace / ".augment" / "commands"
+            workspace_cmd.mkdir(parents=True)
+            (workspace_cmd / "lint.md").write_text("workspace version", encoding="utf-8")
+
+            fake_home = Path(tmp_dir) / "home"
+            user_cmd = fake_home / ".augment" / "commands"
+            user_cmd.mkdir(parents=True)
+            (user_cmd / "lint.md").write_text("user version", encoding="utf-8")
+
+            with mock.patch("augment_mcp.server.Path.home", return_value=fake_home):
+                details = await get_command_details.read(
+                    {"workspace_path": str(workspace), "command_name": "lint"}
+                )
+
+        self.assertEqual(details["scope"], "workspace")
+        self.assertIn("workspace version", details["content"])
+
+    async def test_capabilities_resource_lists_registered_items(self) -> None:
+        capabilities = json.loads(await get_capabilities.read())
+
+        tool_names = {tool["name"] for tool in capabilities["tools"]}
+        prompt_names = {prompt["name"] for prompt in capabilities["prompts"]}
+        resource_uris = {res["uri"] for res in capabilities["resources"]}
+
+        self.assertIn("augment_review", tool_names)
+        self.assertIn("security_review", prompt_names)
+        self.assertIn("augment://workspace/{workspace_path}/settings", resource_uris)
+
     async def test_security_review_prompt_renders_template(self) -> None:
         messages = await security_review_prompt.render(
             {
@@ -215,6 +293,35 @@ class AugmentServerTests(unittest.IsolatedAsyncioTestCase):
         content = messages[0].content.text
         self.assertIn("integration tests", content.lower())
         self.assertIn("pytest", content)
+
+    async def test_api_design_review_prompt_mentions_guidelines(self) -> None:
+        messages = await api_design_review_prompt.render(
+            {
+                "file_path": "src/api/users.py",
+                "api_type": "REST",
+                "guidelines": "https://example.com/api-guidelines",
+            }
+        )
+
+        content = messages[0].content.text
+        self.assertIn("api/users.py", content)
+        self.assertIn("guidelines", content.lower())
+        self.assertIn("HTTP", content)
+
+    async def test_analyze_performance_prompt_lists_focus(self) -> None:
+        messages = await analyze_performance_prompt.render(
+            {
+                "file_path": "src/core/engine.py",
+                "focus": ["cpu", "io"],
+                "include_benchmarks": True,
+            }
+        )
+
+        content = messages[0].content.text
+        lowered = content.lower()
+        self.assertIn("cpu", lowered)
+        self.assertIn("io", lowered)
+        self.assertIn("benchmark", lowered)
 
 
 if __name__ == "__main__":

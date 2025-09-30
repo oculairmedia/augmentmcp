@@ -71,6 +71,11 @@ async def _read_text_file(path: Path) -> str:
     return await loop.run_in_executor(None, path.read_text, "utf-8", "replace")
 
 
+async def _read_json_file(path: Path) -> dict[str, Any]:
+    raw = await _read_text_file(path)
+    return json.loads(raw or "{}")
+
+
 def _extract_command_metadata(text: str) -> dict[str, Any]:
     """Parse simple front matter from a command file if present."""
 
@@ -86,7 +91,13 @@ def _extract_command_metadata(text: str) -> dict[str, Any]:
         if ":" not in stripped:
             continue
         key, value = stripped.split(":", 1)
-        meta[key.strip()] = value.strip()
+        cleaned_key = key.strip()
+        cleaned_value = value.strip()
+        if cleaned_key == "tags":
+            tags = [token.strip() for token in cleaned_value.split(",") if token.strip()]
+            meta[cleaned_key] = tags
+        else:
+            meta[cleaned_key] = cleaned_value
     return meta
 
 
@@ -127,6 +138,72 @@ async def _execute_with_error_handling(
 
 
 @mcp.resource(
+    "augment://capabilities",
+    name="Augment Capabilities",
+    description="Discover available Augment MCP tools, resources, and prompts",
+    mime_type="application/json",
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+async def get_capabilities() -> dict[str, Any]:
+    """Expose high-level information about registered MCP interfaces."""
+
+    tools = await mcp.get_tools()
+    prompts = await mcp.get_prompts()
+    resource_templates = await mcp.get_resource_templates()
+
+    tool_entries = [
+        {
+            "name": name,
+            "description": tool.description,
+            "enabled": tool.enabled,
+        }
+        for name, tool in sorted(tools.items())
+    ]
+
+    prompt_entries = [
+        {
+            "name": name,
+            "description": prompt.description,
+            "tags": sorted(prompt.tags),
+            "enabled": prompt.enabled,
+        }
+        for name, prompt in sorted(prompts.items())
+    ]
+
+    resource_entries = [
+        {
+            "uri": uri,
+            "name": template.name,
+            "description": template.description,
+        }
+        for uri, template in sorted(resource_templates.items())
+    ]
+
+    features = {
+        "workspace_indexing": True,
+        "custom_commands": True,
+        "tool_permissions": True,
+        "mcp_resources": True,
+        "mcp_prompts": True,
+    }
+
+    supported_models = [
+        "claude-sonnet-4",
+        "claude-sonnet-3.5",
+        "gpt-4o",
+        "gpt-4o-mini",
+    ]
+
+    return {
+        "tools": tool_entries,
+        "prompts": prompt_entries,
+        "resources": resource_entries,
+        "features": features,
+        "supported_models": supported_models,
+    }
+
+
+@mcp.resource(
     "augment://workspace/{workspace_path}/settings",
     name="Augment Workspace Settings",
     description="Current Augment configuration and tool permissions for a workspace",
@@ -147,8 +224,7 @@ async def get_workspace_settings(workspace_path: str) -> dict[str, Any]:
         }
 
     try:
-        raw = await _read_text_file(settings_path)
-        data = json.loads(raw or "{}")
+        data = await _read_json_file(settings_path)
     except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover - rare IO errors
         raise ResourceError(f"Failed to read workspace settings: {exc}") from exc
 
@@ -186,6 +262,7 @@ async def _collect_command_entries(root: Path, scope: str) -> list[dict[str, Any
                 "namespace": namespace,
                 "description": meta.get("description"),
                 "tags": meta.get("tags"),
+                "title": meta.get("title"),
             }
         )
 
@@ -217,6 +294,145 @@ async def get_custom_commands(workspace_path: str) -> dict[str, Any]:
         "total": len(commands),
         "commands": commands,
     }
+
+
+@mcp.resource(
+    "augment://workspace/{workspace_path}/tree",
+    name="Augment Workspace Tree",
+    description="Directory structure snapshot for the workspace",
+    mime_type="application/json",
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+async def get_workspace_tree(
+    workspace_path: str,
+    max_depth: int | None = None,
+) -> dict[str, Any]:
+    """Return a truncated directory tree for the workspace."""
+
+    workspace = _expand_workspace(workspace_path)
+    depth = max_depth if max_depth is not None else 3
+    depth = max(depth, 0)
+
+    loop = asyncio.get_running_loop()
+    try:
+        tree = await loop.run_in_executor(None, _build_tree_sync, workspace, depth)
+    except OSError as exc:  # pragma: no cover - permission issues
+        raise ResourceError(f"Failed to walk workspace: {exc}") from exc
+
+    return tree
+
+
+@mcp.resource(
+    "augment://workspace/{workspace_path}/index-status",
+    name="Augment Index Status",
+    description="Status information for Augment workspace indexing",
+    mime_type="application/json",
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+async def get_index_status(workspace_path: str) -> dict[str, Any]:
+    """Read Augment index status metadata when available."""
+
+    workspace = _expand_workspace(workspace_path)
+    status_path = workspace / ".augment" / "index" / "status.json"
+
+    if not status_path.exists():
+        return {
+            "workspace": str(workspace),
+            "status_file": str(status_path),
+            "indexed": False,
+            "message": "Index status file not found",
+        }
+
+    try:
+        data = await _read_json_file(status_path)
+    except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover - read errors
+        raise ResourceError(f"Failed to read index status: {exc}") from exc
+
+    data.setdefault("workspace", str(workspace))
+    data.setdefault("status_file", str(status_path))
+    return data
+
+
+@mcp.resource(
+    "augment://workspace/{workspace_path}/command/{command_name}",
+    name="Augment Command Details",
+    description="Metadata and content for a specific Augment custom command",
+    mime_type="application/json",
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+async def get_command_details(
+    workspace_path: str,
+    command_name: str,
+) -> dict[str, Any]:
+    """Return command metadata and body for a specific command name."""
+
+    workspace = _expand_workspace(workspace_path)
+    candidates = _iter_command_candidates(workspace, command_name)
+
+    if not candidates:
+        raise ResourceError(
+            f"Command '{command_name}' not found in workspace or user commands"
+        )
+
+    scope, path = candidates[0]
+    try:
+        raw = await _read_text_file(path)
+    except OSError as exc:  # pragma: no cover - file permissions
+        raise ResourceError(f"Failed to read command '{command_name}': {exc}") from exc
+
+    meta = _extract_command_metadata(raw)
+
+    return {
+        "name": command_name,
+        "scope": scope,
+        "path": str(path),
+        "meta": meta,
+        "content": raw,
+    }
+
+
+def _iter_command_candidates(workspace: Path, command_name: str) -> list[tuple[str, Path]]:
+    search_roots = [
+        ("workspace", workspace / ".augment" / "commands"),
+        ("user", Path.home() / ".augment" / "commands"),
+    ]
+
+    matches: list[tuple[str, Path]] = []
+    for scope, root in search_roots:
+        if not root.exists():
+            continue
+        for cmd_file in root.rglob("*.md"):
+            if cmd_file.stem == command_name:
+                matches.append((scope, cmd_file))
+    return matches
+
+
+def _build_tree_sync(root: Path, max_depth: int) -> dict[str, Any]:
+    def walk(path: Path, depth: int) -> dict[str, Any]:
+        node: dict[str, Any] = {
+            "name": path.name or str(path),
+            "path": str(path),
+            "type": "directory" if path.is_dir() else "file",
+        }
+
+        if depth >= max_depth:
+            node["truncated"] = path.is_dir()
+            return node
+
+        if path.is_dir():
+            children: list[dict[str, Any]] = []
+            try:
+                for child in sorted(path.iterdir(), key=lambda p: p.name.lower()):
+                    if child.name.startswith("."):
+                        continue
+                    children.append(walk(child, depth + 1))
+            except OSError as exc:
+                node["error"] = str(exc)
+            else:
+                node["children"] = children
+        return node
+
+    return walk(root, 0)
 
 
 @mcp.tool(name="augment_review", description="Use Auggie to review artifacts with Augment context engine")
@@ -368,7 +584,7 @@ def generate_tests_prompt(
     file_path: str,
     test_style: str = "unit",
     frameworks: str | None = None,
-) -> list[dict[str, Any]]:
+) -> list[Message]:
     """Prompt template for generating tests covering a file or module."""
 
     style_notes = {
@@ -397,6 +613,89 @@ The output should include:
 5. Gaps in existing coverage and how to address them
 
 Leverage project conventions and existing helpers when proposing the tests."""
+
+    return [Message(role="user", content=content)]
+
+
+@mcp.prompt(
+    name="api_design_review",
+    description="Evaluate API design decisions with consistency and best practices",
+    tags={"api", "design", "review"},
+)
+def api_design_review_prompt(
+    file_path: str,
+    api_type: str = "REST",
+    guidelines: str | None = None,
+) -> list[Message]:
+    """Prompt template for API design analysis."""
+
+    type_notes = {
+        "REST": "Assess resource modelling, HTTP verb usage, status codes, and pagination.",
+        "GRAPHQL": "Evaluate schema design, query complexity, resolver patterns, and caching strategies.",
+        "GRPC": "Review service definitions, streaming usage, compatibility, and error handling.",
+    }
+
+    focus_note = type_notes.get(api_type.upper(), type_notes["REST"])
+    guidelines_note = (
+        f"Follow the documented guidelines: {guidelines}."
+        if guidelines
+        else "Reference existing project API standards and established industry guidelines."
+    )
+
+    content = f"""Review the API implementation in `{file_path}`.
+
+API style: {api_type}
+{focus_note}
+{guidelines_note}
+
+For the review, cover:
+1. Request and response structure clarity
+2. Error handling strategy and surface
+3. Versioning and backwards compatibility considerations
+4. Authentication and authorization enforcement
+5. Performance implications and rate limiting
+6. Documentation or discoverability gaps
+
+Compare this API with existing endpoints in the workspace to maintain consistency."""
+
+    return [Message(role="user", content=content)]
+
+
+@mcp.prompt(
+    name="analyze_performance",
+    description="Investigate performance hotspots and optimisation opportunities",
+    tags={"performance", "analysis"},
+)
+def analyze_performance_prompt(
+    file_path: str,
+    focus: list[str] | None = None,
+    include_benchmarks: bool = False,
+) -> list[Message]:
+    """Prompt template encouraging structured performance analysis."""
+
+    focus_items = focus or ["cpu", "memory"]
+    focus_text = "\n".join(f"- {item.title()} usage and bottlenecks" for item in focus_items)
+    benchmark_note = (
+        "Include benchmark scenarios and target metrics for the proposed optimisations."
+        if include_benchmarks
+        else "Call out relevant metrics or profiling tools without drafting full benchmarks."
+    )
+
+    content = f"""Analyse performance characteristics of `{file_path}`.
+
+Primary focus areas:
+{focus_text}
+
+{benchmark_note}
+
+Provide:
+1. Summary of current performance risks or antipatterns
+2. Proposed improvements with estimated impact
+3. References to similar optimised code within the workspace
+4. Potential trade-offs or regression risks
+5. Suggested monitoring or alerting follow-up
+
+Use workspace context (profiling data, comparable modules, configuration) to ground the analysis."""
 
     return [Message(role="user", content=content)]
 

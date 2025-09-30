@@ -183,16 +183,26 @@ team workflows.
 
 ## MCP Resources
 
+- `augment://capabilities` — Server capability metadata including registered tools,
+  prompts, and supported features.
 - `augment://workspace/{workspace_path}/settings` — Augment configuration and tool
   permissions for the workspace.
 - `augment://workspace/{workspace_path}/commands` — Catalog of workspace and user-level
   custom commands with basic metadata.
+- `augment://workspace/{workspace_path}/command/{command_name}` — Detailed metadata and
+  source content for a specific custom command.
+- `augment://workspace/{workspace_path}/tree` — Truncated directory tree for quick
+  navigation previews.
+- `augment://workspace/{workspace_path}/index-status` — Insights into indexing state if
+  Augment has produced status data for the workspace.
 
 ## MCP Prompts
 
 - `security_review` — Generates a detailed security audit brief for a target file.
 - `refactor_code` — Produces a scoped refactoring plan with explicit improvement goals.
 - `generate_tests` — Suggests a structured set of automated tests and coverage notes.
+- `api_design_review` — Reviews the design quality of REST/gRPC/GraphQL endpoints.
+- `analyze_performance` — Guides performance investigations with targeted focus areas.
 
 Clients can fetch prompts via `prompts/list` and render them with context-specific
 arguments to standardise review requests across the team.
