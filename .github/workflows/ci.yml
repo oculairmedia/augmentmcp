@@ -28,9 +28,12 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   docker-build:
-    name: Build container image
+    name: Build and publish container image
     runs-on: ubuntu-latest
     needs: tests
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -38,5 +41,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image
-        run: docker build --tag augment-mcp-ci .
+      - name: Set image name
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/augment-mcp" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build container image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ env.IMAGE_NAME }}:latest
