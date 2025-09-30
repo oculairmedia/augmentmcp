@@ -16,6 +16,7 @@ __all__ = [
     "AuggieCommandError",
     "AuggieRunResult",
     "run_auggie",
+    "run_auggie_command",
 ]
 
 
@@ -81,37 +82,21 @@ def _quote_arg(arg: str) -> str:
     return f'"{arg}"' if " " in arg else arg
 
 
-async def run_auggie(
+async def _execute_auggie(
     *,
-    instruction: str,
-    input_text: str | None = None,
-    compact: bool | None = None,
-    github_api_token: str | None = None,
-    extra_args: Sequence[str] | None = None,
-    timeout_seconds: float | None = None,
-    session_token: str | None = None,
-    binary_path: str | None = None,
+    args: Sequence[str],
+    input_text: str | None,
+    timeout_seconds: float | None,
+    session_token: str | None,
+    binary_path: str | None,
 ) -> AuggieRunResult:
-    """Execute the Auggie CLI with the provided options."""
-
-    instruction = instruction.strip()
-    if not instruction:
-        raise AuggieError("Instruction is required for Auggie invocations")
+    """Spawn Auggie with the provided arguments and return the result."""
 
     binary = binary_path or _default_binary_path()
     env = os.environ.copy()
     token = session_token or env.get("AUGMENT_SESSION_AUTH")
     if token:
         env["AUGMENT_SESSION_AUTH"] = token
-
-    args: list[str] = []
-    if compact:
-        args.append("--compact")
-    if github_api_token:
-        args.extend(["--github-api-token", github_api_token])
-    if extra_args:
-        args.extend(extra_args)
-    args.extend(["--print", instruction])
 
     command = " ".join((_quote_arg(binary), *(_quote_arg(arg) for arg in args)))
 
@@ -189,3 +174,66 @@ async def run_auggie(
         raise AuggieCommandError(result)
 
     return result
+
+
+async def run_auggie(
+    *,
+    instruction: str,
+    input_text: str | None = None,
+    workspace_root: str | None = None,
+    model: str | None = None,
+    compact: bool | None = None,
+    github_api_token: str | None = None,
+    extra_args: Sequence[str] | None = None,
+    timeout_seconds: float | None = None,
+    session_token: str | None = None,
+    binary_path: str | None = None,
+) -> AuggieRunResult:
+    """Execute the Auggie CLI with the provided options."""
+
+    instruction = instruction.strip()
+    if not instruction:
+        raise AuggieError("Instruction is required for Auggie invocations")
+
+    args: list[str] = []
+    if workspace_root:
+        args.extend(["--workspace-root", workspace_root])
+    if model:
+        args.extend(["--model", model])
+    if compact:
+        args.append("--compact")
+    if github_api_token:
+        args.extend(["--github-api-token", github_api_token])
+    if extra_args:
+        args.extend(extra_args)
+    args.extend(["--print", instruction])
+
+    return await _execute_auggie(
+        args=args,
+        input_text=input_text,
+        timeout_seconds=timeout_seconds,
+        session_token=session_token,
+        binary_path=binary_path,
+    )
+
+
+async def run_auggie_command(
+    *,
+    args: Sequence[str],
+    input_text: str | None = None,
+    timeout_seconds: float | None = None,
+    session_token: str | None = None,
+    binary_path: str | None = None,
+) -> AuggieRunResult:
+    """Execute Auggie with arbitrary arguments."""
+
+    if not args:
+        raise AuggieError("At least one argument is required to invoke Auggie")
+
+    return await _execute_auggie(
+        args=args,
+        input_text=input_text,
+        timeout_seconds=timeout_seconds,
+        session_token=session_token,
+        binary_path=binary_path,
+    )

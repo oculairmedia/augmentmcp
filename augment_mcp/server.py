@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+from collections.abc import Awaitable, Sequence
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -17,7 +19,9 @@ from .auggie import (
     AuggieError,
     AuggieNotInstalledError,
     AuggieTimeoutError,
+    AuggieRunResult,
     run_auggie,
+    run_auggie_command,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -55,11 +59,49 @@ async def _load_paths(paths: Iterable[str]) -> str:
     return "\n\n".join(chunks)
 
 
+async def _execute_with_error_handling(
+    call: Awaitable[AuggieRunResult],
+    *,
+    workspace_root: str | None = None,
+) -> str:
+    """Run an Auggie coroutine and normalize errors into ToolError."""
+
+    try:
+        result = await call
+    except AuggieNotInstalledError as exc:
+        raise ToolError(str(exc)) from exc
+    except AuggieTimeoutError as exc:
+        raise ToolError(str(exc)) from exc
+    except AuggieAbortedError as exc:
+        raise ToolError(str(exc)) from exc
+    except AuggieCommandError as exc:
+        message = [str(exc)]
+        if workspace_root:
+            message.append(f"Workspace: {workspace_root}")
+        stderr = exc.result.stderr.strip()
+        stdout = exc.result.stdout.strip()
+        if stderr:
+            message.append(f"stderr:\n{stderr}")
+        if stdout:
+            message.append(f"stdout:\n{stdout}")
+        raise ToolError("\n\n".join(message)) from exc
+    except AuggieError as exc:
+        raise ToolError(str(exc)) from exc
+
+    if result.stderr.strip():
+        LOGGER.warning("Auggie stderr: %s", result.stderr.strip())
+
+    output = result.stdout.strip()
+    return output or "Auggie produced no output"
+
+
 @mcp.tool(name="augment_review", description="Use Auggie to review artifacts with Augment context engine")
 async def augment_review(
     instruction: str,
     context: str | None = None,
     paths: list[str] | None = None,
+    workspace_root: str | None = None,
+    model: str | None = None,
     compact: bool | None = None,
     github_api_token: str | None = None,
     timeout_ms: int | None = None,
@@ -78,40 +120,122 @@ async def augment_review(
 
     timeout_seconds = timeout_ms / 1000 if timeout_ms is not None else None
 
-    try:
-        result = await run_auggie(
+    return await _execute_with_error_handling(
+        run_auggie(
             instruction=instruction,
             input_text=combined_context,
+            workspace_root=workspace_root,
+            model=model,
             compact=compact,
             github_api_token=github_api_token,
             extra_args=extra_args,
             timeout_seconds=timeout_seconds,
             session_token=session_token,
             binary_path=binary_path,
-        )
-    except AuggieNotInstalledError as exc:
-        raise ToolError(str(exc)) from exc
-    except AuggieTimeoutError as exc:
-        raise ToolError(str(exc)) from exc
-    except AuggieAbortedError as exc:
-        raise ToolError(str(exc)) from exc
-    except AuggieCommandError as exc:
-        message = [str(exc)]
-        stderr = exc.result.stderr.strip()
-        stdout = exc.result.stdout.strip()
-        if stderr:
-            message.append(f"stderr:\n{stderr}")
-        if stdout:
-            message.append(f"stdout:\n{stdout}")
-        raise ToolError("\n\n".join(message)) from exc
-    except AuggieError as exc:
-        raise ToolError(str(exc)) from exc
+        ),
+        workspace_root=workspace_root,
+    )
 
-    if result.stderr.strip():
-        LOGGER.warning("Auggie stderr: %s", result.stderr.strip())
 
-    output = result.stdout.strip()
-    return output or "Auggie produced no output"
+@mcp.tool(
+    name="augment_configure",
+    description="Configure Augment tool permissions for a workspace",
+)
+async def augment_configure(
+    workspace_root: str,
+    permissions: Any,
+    scope: Literal["user", "project"] = "project",
+) -> str:
+    """Write Augment permission configuration to the appropriate settings file."""
+
+    if scope not in {"user", "project"}:
+        raise ToolError("scope must be either 'user' or 'project'")
+
+    if scope == "project":
+        settings_root = Path(workspace_root).expanduser()
+        if not settings_root.exists():
+            raise ToolError(f"Workspace root does not exist: {workspace_root}")
+        settings_path = settings_root / ".augment" / "settings.json"
+    else:
+        settings_path = Path.home() / ".augment" / "settings.json"
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    config = {"tool-permissions": permissions}
+
+    try:
+        settings_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - filesystem errors
+        raise ToolError(f"Failed to write settings: {exc}") from exc
+
+    return f"Configured tool permissions at {settings_path}"
+
+
+@mcp.tool(
+    name="augment_custom_command",
+    description="Execute a custom Auggie command for reusable workflows",
+)
+async def augment_custom_command(
+    command_name: str,
+    arguments: Sequence[str] | str | None = None,
+    workspace_root: str | None = None,
+    timeout_ms: int | None = None,
+    binary_path: str | None = None,
+    session_token: str | None = None,
+) -> str:
+    """Run a custom Auggie command and return its output."""
+
+    arg_list: list[str] = ["command", command_name]
+
+    if arguments:
+        if isinstance(arguments, str):
+            arg_list.append(arguments)
+        else:
+            arg_list.extend(arguments)
+
+    if workspace_root:
+        arg_list.extend(["--workspace-root", workspace_root])
+
+    timeout_seconds = timeout_ms / 1000 if timeout_ms is not None else None
+
+    return await _execute_with_error_handling(
+        run_auggie_command(
+            args=arg_list,
+            timeout_seconds=timeout_seconds,
+            session_token=session_token,
+            binary_path=binary_path,
+        ),
+        workspace_root=workspace_root,
+    )
+
+
+@mcp.tool(
+    name="augment_list_commands",
+    description="List available Auggie custom commands",
+)
+async def augment_list_commands(
+    workspace_root: str | None = None,
+    timeout_ms: int | None = None,
+    binary_path: str | None = None,
+    session_token: str | None = None,
+) -> str:
+    """List registered Auggie slash commands."""
+
+    args = ["command", "list"]
+    if workspace_root:
+        args.extend(["--workspace-root", workspace_root])
+
+    timeout_seconds = timeout_ms / 1000 if timeout_ms is not None else None
+
+    return await _execute_with_error_handling(
+        run_auggie_command(
+            args=args,
+            timeout_seconds=timeout_seconds,
+            session_token=session_token,
+            binary_path=binary_path,
+        ),
+        workspace_root=workspace_root,
+    )
 
 
 def main() -> None:
