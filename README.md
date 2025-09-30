@@ -115,10 +115,22 @@ stopped.
         "AUGMENT_MCP_HOST": "127.0.0.1",
         "AUGMENT_MCP_PORT": "8000"
       }
+    },
+    "Context 7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp@latest"]
+    },
+    "Sequential thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
     }
   }
 }
 ```
+
+The additional MCP servers above provide Auggie with advanced semantic search (Context7)
+and guided reasoning utilities (Sequential Thinking). They are optional but recommended for
+rich project context and structured analysis.
 
 ## Tool Reference
 
