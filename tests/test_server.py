@@ -21,6 +21,11 @@ from augment_mcp.server import (
     augment_custom_command,
     augment_list_commands,
     augment_review,
+    generate_tests_prompt,
+    get_custom_commands,
+    get_workspace_settings,
+    refactor_code_prompt,
+    security_review_prompt,
 )
 
 
@@ -123,6 +128,93 @@ class AugmentServerTests(unittest.IsolatedAsyncioTestCase):
             data = json.loads(settings_path.read_text(encoding="utf-8"))
             self.assertEqual(data["tool-permissions"], permissions)
             self.assertIn(str(settings_path), message)
+
+    async def test_workspace_settings_resource_handles_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = await get_workspace_settings.read({"workspace_path": tmp_dir})
+
+        self.assertFalse(result["exists"])
+        self.assertIn("settings_file", result)
+
+    async def test_workspace_settings_resource_reads_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            settings_path = workspace / ".augment" / "settings.json"
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"tool-permissions": [{"tool-name": "view", "permission": {"type": "allow"}}]}
+            settings_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = await get_workspace_settings.read({"workspace_path": str(workspace)})
+
+        self.assertTrue(result["exists"])
+        self.assertEqual(result["tool_permissions"], payload["tool-permissions"])
+
+    async def test_custom_commands_resource_collects_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir) / "workspace"
+            workspace.mkdir()
+            workspace_cmd = workspace / ".augment" / "commands"
+            workspace_cmd.mkdir(parents=True)
+            (workspace_cmd / "security-review.md").write_text(
+                "---\ndescription: Workspace security review\n---\ncontent", encoding="utf-8"
+            )
+
+            fake_home = Path(tmp_dir) / "home"
+            user_cmd = fake_home / ".augment" / "commands"
+            user_cmd.mkdir(parents=True)
+            (user_cmd / "lint.md").write_text(
+                "---\ndescription: User lint command\n---\ncontent", encoding="utf-8"
+            )
+
+            with mock.patch("augment_mcp.server.Path.home", return_value=fake_home):
+                result = await get_custom_commands.read({"workspace_path": str(workspace)})
+
+        names = {cmd["name"] for cmd in result["commands"]}
+        scopes = {cmd["scope"] for cmd in result["commands"]}
+        self.assertEqual(result["total"], 2)
+        self.assertSetEqual(names, {"security-review", "lint"})
+        self.assertSetEqual(scopes, {"workspace", "user"})
+
+    async def test_security_review_prompt_renders_template(self) -> None:
+        messages = await security_review_prompt.render(
+            {
+                "file_path": "src/auth.py",
+                "focus_areas": "auth",
+                "severity_threshold": "high",
+            }
+        )
+
+        self.assertEqual(len(messages), 1)
+        content = messages[0].content.text
+        self.assertIn("src/auth.py", content)
+        self.assertIn("Severity (low/medium/high/critical)", content)
+
+    async def test_refactor_code_prompt_lists_goals(self) -> None:
+        messages = await refactor_code_prompt.render(
+            {
+                "file_path": "src/service.py",
+                "goals": ["performance", "modularity"],
+                "preserve_behavior": False,
+            }
+        )
+
+        content = messages[0].content.text
+        self.assertIn("optimise hot paths", content.lower())
+        self.assertIn("separation of concerns", content.lower())
+        self.assertIn("Minor behaviour adjustments", content)
+
+    async def test_generate_tests_prompt_uses_style_notes(self) -> None:
+        messages = await generate_tests_prompt.render(
+            {
+                "file_path": "src/api.py",
+                "test_style": "integration",
+                "frameworks": "pytest",
+            }
+        )
+
+        content = messages[0].content.text
+        self.assertIn("integration tests", content.lower())
+        self.assertIn("pytest", content)
 
 
 if __name__ == "__main__":

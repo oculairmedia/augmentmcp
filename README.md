@@ -14,6 +14,8 @@ transport.
 - Enforced tool permissions with `augment_configure`
 - Reusable slash commands via `augment_custom_command` and discovery with
   `augment_list_commands`
+- Discoverable MCP prompts for common review workflows
+- Read-only resources exposing Augment settings and command catalogs
 - Graceful handling of timeouts, cancellations, and CLI errors
 
 ## Prerequisites
@@ -178,6 +180,22 @@ prompt templates. Additional arguments are forwarded to the command and optional
 
 Lists available custom commands for the provided workspace so developers can discover
 team workflows.
+
+## MCP Resources
+
+- `augment://workspace/{workspace_path}/settings` — Augment configuration and tool
+  permissions for the workspace.
+- `augment://workspace/{workspace_path}/commands` — Catalog of workspace and user-level
+  custom commands with basic metadata.
+
+## MCP Prompts
+
+- `security_review` — Generates a detailed security audit brief for a target file.
+- `refactor_code` — Produces a scoped refactoring plan with explicit improvement goals.
+- `generate_tests` — Suggests a structured set of automated tests and coverage notes.
+
+Clients can fetch prompts via `prompts/list` and render them with context-specific
+arguments to standardise review requests across the team.
 
 ## Workspace Indexing
 
