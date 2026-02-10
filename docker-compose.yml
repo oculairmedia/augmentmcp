@@ -11,3 +11,9 @@ services:
     volumes:
       - /opt/stacks:/opt/stacks
     restart: unless-stopped
+    labels:
+      - homepage.group=AI & Automation
+      - homepage.name=Augment MCP
+      - homepage.icon=si-docker
+      - homepage.href=http://192.168.50.90:503
+      - homepage.description=MCP tool for augmentation

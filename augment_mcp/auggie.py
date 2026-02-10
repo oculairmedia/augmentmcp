@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
 from dataclasses import dataclass
 from typing import Sequence
+
+from .telemetry import record_auggie_run
 
 __all__ = [
     "AuggieError",
@@ -80,6 +83,13 @@ def _default_binary_path() -> str:
 
 def _quote_arg(arg: str) -> str:
     return f'"{arg}"' if " " in arg else arg
+
+
+def _extract_flag_value(args: Sequence[str], flag: str) -> str | None:
+    for index, value in enumerate(args):
+        if value == flag and index + 1 < len(args):
+            return args[index + 1]
+    return None
 
 
 async def _execute_auggie(
@@ -208,13 +218,49 @@ async def run_auggie(
         args.extend(extra_args)
     args.extend(["--print", instruction])
 
-    return await _execute_auggie(
-        args=args,
-        input_text=input_text,
-        timeout_seconds=timeout_seconds,
-        session_token=session_token,
-        binary_path=binary_path,
-    )
+    binary = binary_path or _default_binary_path()
+    command_display = " ".join((_quote_arg(binary), *(_quote_arg(arg) for arg in args)))
+
+    start_time = time.perf_counter()
+    success = False
+    output_length = 0
+    error_message: str | None = None
+
+    try:
+        result = await _execute_auggie(
+            args=args,
+            input_text=input_text,
+            timeout_seconds=timeout_seconds,
+            session_token=session_token,
+            binary_path=binary_path,
+        )
+        success = True
+        output_length = len(result.stdout)
+        command_display = result.command or command_display
+        return result
+    except AuggieCommandError as exc:
+        output_length = len(exc.result.stdout)
+        command_display = exc.result.command or command_display
+        error_message = exc.result.stderr.strip() or str(exc)
+        raise
+    except AuggieError as exc:
+        error_message = str(exc)
+        raise
+    except Exception as exc:  # pragma: no cover - defensive recording
+        error_message = str(exc)
+        raise
+    finally:
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        record_auggie_run(
+            command=command_display,
+            instruction=instruction,
+            workspace_root=workspace_root,
+            model=model,
+            duration_ms=duration_ms,
+            success=success,
+            output_length=output_length,
+            error=error_message,
+        )
 
 
 async def run_auggie_command(
@@ -230,10 +276,50 @@ async def run_auggie_command(
     if not args:
         raise AuggieError("At least one argument is required to invoke Auggie")
 
-    return await _execute_auggie(
-        args=args,
-        input_text=input_text,
-        timeout_seconds=timeout_seconds,
-        session_token=session_token,
-        binary_path=binary_path,
-    )
+    arg_list = list(args)
+    binary = binary_path or _default_binary_path()
+    command_display = " ".join((_quote_arg(binary), *(_quote_arg(arg) for arg in arg_list)))
+
+    workspace_root = _extract_flag_value(arg_list, "--workspace-root")
+    model = _extract_flag_value(arg_list, "--model")
+
+    start_time = time.perf_counter()
+    success = False
+    output_length = 0
+    error_message: str | None = None
+
+    try:
+        result = await _execute_auggie(
+            args=arg_list,
+            input_text=input_text,
+            timeout_seconds=timeout_seconds,
+            session_token=session_token,
+            binary_path=binary_path,
+        )
+        success = True
+        output_length = len(result.stdout)
+        command_display = result.command or command_display
+        return result
+    except AuggieCommandError as exc:
+        output_length = len(exc.result.stdout)
+        command_display = exc.result.command or command_display
+        error_message = exc.result.stderr.strip() or str(exc)
+        raise
+    except AuggieError as exc:
+        error_message = str(exc)
+        raise
+    except Exception as exc:  # pragma: no cover - defensive recording
+        error_message = str(exc)
+        raise
+    finally:
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        record_auggie_run(
+            command=command_display,
+            instruction=None,
+            workspace_root=workspace_root,
+            model=model,
+            duration_ms=duration_ms,
+            success=success,
+            output_length=output_length,
+            error=error_message,
+        )

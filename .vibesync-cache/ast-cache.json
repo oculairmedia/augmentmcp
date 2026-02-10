@@ -1,0 +1,372 @@
+{
+  "projectId": "AUGMT",
+  "version": 1,
+  "updatedAt": 1769588084581,
+  "files": {
+    "augment_mcp/auggie.py": {
+      "path": "augment_mcp/auggie.py",
+      "contentHash": "ad64212fb848595a33680176ecd5593b",
+      "mtime": 1759238686656.8926,
+      "functions": [
+        {
+          "name": "run_auggie",
+          "signature": "def run_auggie(\n    *,\n    instruction: str,\n    input_text: str | None = None,\n    workspace_root: str | None = None,\n    model: str | None = None,\n    compact: bool | None = None,\n    github_api_token: str | None = None,\n    extra_args: Sequence[str] | None = None,\n    timeout_seconds: float | None = None,\n    session_token: str | None = None,\n    binary_path: str | None = None,\n) -> AuggieRunResult",
+          "parameters": "(\n    *,\n    instruction: str,\n    input_text: str | None = None,\n    workspace_root: str | None = None,\n    model: str | None = None,\n    compact: bool | None = None,\n    github_api_token: str | None = None,\n    extra_args: Sequence[str] | None = None,\n    timeout_seconds: float | None = None,\n    session_token: str | None = None,\n    binary_path: str | None = None,\n)",
+          "return_type": "AuggieRunResult",
+          "docstring": "Execute the Auggie CLI with the provided options.",
+          "decorators": [],
+          "start_line": 189,
+          "end_line": 263,
+          "is_async": true
+        },
+        {
+          "name": "run_auggie_command",
+          "signature": "def run_auggie_command(\n    *,\n    args: Sequence[str],\n    input_text: str | None = None,\n    timeout_seconds: float | None = None,\n    session_token: str | None = None,\n    binary_path: str | None = None,\n) -> AuggieRunResult",
+          "parameters": "(\n    *,\n    args: Sequence[str],\n    input_text: str | None = None,\n    timeout_seconds: float | None = None,\n    session_token: str | None = None,\n    binary_path: str | None = None,\n)",
+          "return_type": "AuggieRunResult",
+          "docstring": "Execute Auggie with arbitrary arguments.",
+          "decorators": [],
+          "start_line": 266,
+          "end_line": 325,
+          "is_async": true
+        }
+      ],
+      "parsedAt": 1769588048335
+    },
+    "augment_mcp/server.py": {
+      "path": "augment_mcp/server.py",
+      "contentHash": "d1df1fc2dbcb21ba626a0f46d8473bf8",
+      "mtime": 1759239210002.2153,
+      "functions": [
+        {
+          "name": "get_capabilities",
+          "signature": "def get_capabilities() -> dict[str, Any]",
+          "parameters": "()",
+          "return_type": "dict[str, Any]",
+          "docstring": "Expose high-level information about registered MCP interfaces.",
+          "decorators": [
+            "@mcp.resource(\n    \"augment://capabilities\",\n    name=\"Augment Capabilities\",\n    description=\"Discover available Augment MCP tools, resources, and prompts\",\n    mime_type=\"application/json\",\n    annotations={\"readOnlyHint\": True, \"idempotentHint\": True},\n)"
+          ],
+          "start_line": 372,
+          "end_line": 432,
+          "is_async": true
+        },
+        {
+          "name": "get_workspace_settings",
+          "signature": "def get_workspace_settings(workspace_path: str) -> dict[str, Any]",
+          "parameters": "(workspace_path: str)",
+          "return_type": "dict[str, Any]",
+          "docstring": "Expose Augment settings for the provided workspace.",
+          "decorators": [
+            "@mcp.resource(\n    \"augment://workspace/{workspace_path}/settings\",\n    name=\"Augment Workspace Settings\",\n    description=\"Current Augment configuration and tool permissions for a workspace\",\n    mime_type=\"application/json\",\n    annotations={\"readOnlyHint\": True, \"idempotentHint\": True},\n)"
+          ],
+          "start_line": 442,
+          "end_line": 467,
+          "is_async": true
+        },
+        {
+          "name": "get_custom_commands",
+          "signature": "def get_custom_commands(workspace_path: str) -> dict[str, Any]",
+          "parameters": "(workspace_path: str)",
+          "return_type": "dict[str, Any]",
+          "docstring": "Enumerate workspace and user-level Augment command files.",
+          "decorators": [
+            "@mcp.resource(\n    \"augment://workspace/{workspace_path}/commands\",\n    name=\"Augment Custom Commands\",\n    description=\"List available Augment custom command definitions\",\n    mime_type=\"application/json\",\n    annotations={\"readOnlyHint\": True, \"idempotentHint\": True},\n)"
+          ],
+          "start_line": 509,
+          "end_line": 527,
+          "is_async": true
+        },
+        {
+          "name": "get_workspace_tree",
+          "signature": "def get_workspace_tree(\n    workspace_path: str,\n    max_depth: int | None = None,\n) -> dict[str, Any]",
+          "parameters": "(\n    workspace_path: str,\n    max_depth: int | None = None,\n)",
+          "return_type": "dict[str, Any]",
+          "docstring": "Return a truncated directory tree for the workspace.",
+          "decorators": [
+            "@mcp.resource(\n    \"augment://workspace/{workspace_path}/tree\",\n    name=\"Augment Workspace Tree\",\n    description=\"Directory structure snapshot for the workspace\",\n    mime_type=\"application/json\",\n    annotations={\"readOnlyHint\": True, \"idempotentHint\": True},\n)"
+          ],
+          "start_line": 537,
+          "end_line": 554,
+          "is_async": true
+        },
+        {
+          "name": "get_index_status",
+          "signature": "def get_index_status(workspace_path: str) -> dict[str, Any]",
+          "parameters": "(workspace_path: str)",
+          "return_type": "dict[str, Any]",
+          "docstring": "Read Augment index status metadata when available.",
+          "decorators": [
+            "@mcp.resource(\n    \"augment://workspace/{workspace_path}/index-status\",\n    name=\"Augment Index Status\",\n    description=\"Status information for Augment workspace indexing\",\n    mime_type=\"application/json\",\n    annotations={\"readOnlyHint\": True, \"idempotentHint\": True},\n)"
+          ],
+          "start_line": 564,
+          "end_line": 586,
+          "is_async": true
+        },
+        {
+          "name": "get_command_details",
+          "signature": "def get_command_details(\n    workspace_path: str,\n    command_name: str,\n) -> dict[str, Any]",
+          "parameters": "(\n    workspace_path: str,\n    command_name: str,\n)",
+          "return_type": "dict[str, Any]",
+          "docstring": "Return command metadata and body for a specific command name.",
+          "decorators": [
+            "@mcp.resource(\n    \"augment://workspace/{workspace_path}/command/{command_name}\",\n    name=\"Augment Command Details\",\n    description=\"Metadata and content for a specific Augment custom command\",\n    mime_type=\"application/json\",\n    annotations={\"readOnlyHint\": True, \"idempotentHint\": True},\n)"
+          ],
+          "start_line": 596,
+          "end_line": 625,
+          "is_async": true
+        },
+        {
+          "name": "search_workspace",
+          "signature": "def search_workspace(\n    workspace_path: str,\n    query: str | None = None,\n    max_results: int = 20,\n    context_lines: int = 2,\n) -> dict[str, Any]",
+          "parameters": "(\n    workspace_path: str,\n    query: str | None = None,\n    max_results: int = 20,\n    context_lines: int = 2,\n)",
+          "return_type": "dict[str, Any]",
+          "docstring": "Search workspace files using ripgrep, grep, or a Python fallback.",
+          "decorators": [
+            "@mcp.resource(\n    \"augment://workspace/{workspace_path}/search\",\n    name=\"Augment Workspace Search\",\n    description=\"Search workspace files for a query string\",\n    mime_type=\"application/json\",\n    annotations={\"readOnlyHint\": True, \"idempotentHint\": False},\n)"
+          ],
+          "start_line": 679,
+          "end_line": 729,
+          "is_async": true
+        },
+        {
+          "name": "get_auggie_history",
+          "signature": "def get_auggie_history(scope: str = \"global\", limit: int = 50) -> dict[str, Any]",
+          "parameters": "(scope: str = \"global\", limit: int = 50)",
+          "return_type": "dict[str, Any]",
+          "docstring": "Return recent Auggie execution history.",
+          "decorators": [
+            "@mcp.resource(\n    \"augment://history/{scope}/runs\",\n    name=\"Auggie Run History\",\n    description=\"Recent Auggie CLI invocations and their results\",\n    mime_type=\"application/json\",\n    annotations={\"readOnlyHint\": True, \"idempotentHint\": False},\n)"
+          ],
+          "start_line": 739,
+          "end_line": 745,
+          "is_async": true
+        },
+        {
+          "name": "get_performance_metrics",
+          "signature": "def get_performance_metrics(scope: str = \"server\") -> dict[str, Any]",
+          "parameters": "(scope: str = \"server\")",
+          "return_type": "dict[str, Any]",
+          "docstring": "Expose telemetry metrics collected by the server.",
+          "decorators": [
+            "@mcp.resource(\n    \"augment://metrics/{scope}/performance\",\n    name=\"Performance Metrics\",\n    description=\"Server performance metrics and aggregated statistics\",\n    mime_type=\"application/json\",\n    annotations={\"readOnlyHint\": True, \"idempotentHint\": True},\n)"
+          ],
+          "start_line": 755,
+          "end_line": 761,
+          "is_async": true
+        },
+        {
+          "name": "augment_review",
+          "signature": "def augment_review(\n    instruction: str,\n    context: str | None = None,\n    paths: list[str] | None = None,\n    workspace_root: str | None = None,\n    model: str | None = None,\n    compact: bool | None = None,\n    github_api_token: str | None = None,\n    timeout_ms: int | None = None,\n    extra_args: list[str] | None = None,\n    binary_path: str | None = None,\n    session_token: str | None = None,\n) -> str",
+          "parameters": "(\n    instruction: str,\n    context: str | None = None,\n    paths: list[str] | None = None,\n    workspace_root: str | None = None,\n    model: str | None = None,\n    compact: bool | None = None,\n    github_api_token: str | None = None,\n    timeout_ms: int | None = None,\n    extra_args: list[str] | None = None,\n    binary_path: str | None = None,\n    session_token: str | None = None,\n)",
+          "return_type": "str",
+          "docstring": "Invoke Auggie CLI with the provided instruction and context.",
+          "decorators": [
+            "@mcp.tool(name=\"augment_review\", description=\"Use Auggie to review artifacts with Augment context engine\")"
+          ],
+          "start_line": 765,
+          "end_line": 804,
+          "is_async": true
+        },
+        {
+          "name": "security_review_prompt",
+          "signature": "def security_review_prompt(\n    file_path: str,\n    focus_areas: str = \"all\",\n    severity_threshold: str = \"medium\",\n) -> list[dict[str, Any]]",
+          "parameters": "(\n    file_path: str,\n    focus_areas: str = \"all\",\n    severity_threshold: str = \"medium\",\n)",
+          "return_type": "list[dict[str, Any]]",
+          "docstring": "Prompt template for requesting a security-focused review.",
+          "decorators": [
+            "@mcp.prompt(\n    name=\"security_review\",\n    description=\"Generate a comprehensive security review request for a file\",\n    tags={\"security\", \"review\", \"code-quality\"},\n)"
+          ],
+          "start_line": 812,
+          "end_line": 853,
+          "is_async": false
+        },
+        {
+          "name": "refactor_code_prompt",
+          "signature": "def refactor_code_prompt(\n    file_path: str,\n    goals: list[str] | None = None,\n    preserve_behavior: bool = True,\n) -> list[Message]",
+          "parameters": "(\n    file_path: str,\n    goals: list[str] | None = None,\n    preserve_behavior: bool = True,\n)",
+          "return_type": "list[Message]",
+          "docstring": "Prompt template for structured refactoring guidance.",
+          "decorators": [
+            "@mcp.prompt(\n    name=\"refactor_code\",\n    description=\"Request a refactoring plan with targeted improvement goals\",\n    tags={\"refactoring\", \"code-quality\"},\n)"
+          ],
+          "start_line": 861,
+          "end_line": 904,
+          "is_async": false
+        },
+        {
+          "name": "generate_tests_prompt",
+          "signature": "def generate_tests_prompt(\n    file_path: str,\n    test_style: str = \"unit\",\n    frameworks: str | None = None,\n) -> list[Message]",
+          "parameters": "(\n    file_path: str,\n    test_style: str = \"unit\",\n    frameworks: str | None = None,\n)",
+          "return_type": "list[Message]",
+          "docstring": "Prompt template for generating tests covering a file or module.",
+          "decorators": [
+            "@mcp.prompt(\n    name=\"generate_tests\",\n    description=\"Request targeted automated tests for recent changes\",\n    tags={\"testing\", \"quality\"},\n)"
+          ],
+          "start_line": 912,
+          "end_line": 947,
+          "is_async": false
+        },
+        {
+          "name": "api_design_review_prompt",
+          "signature": "def api_design_review_prompt(\n    file_path: str,\n    api_type: str = \"REST\",\n    guidelines: str | None = None,\n) -> list[Message]",
+          "parameters": "(\n    file_path: str,\n    api_type: str = \"REST\",\n    guidelines: str | None = None,\n)",
+          "return_type": "list[Message]",
+          "docstring": "Prompt template for API design analysis.",
+          "decorators": [
+            "@mcp.prompt(\n    name=\"api_design_review\",\n    description=\"Evaluate API design decisions with consistency and best practices\",\n    tags={\"api\", \"design\", \"review\"},\n)"
+          ],
+          "start_line": 955,
+          "end_line": 992,
+          "is_async": false
+        },
+        {
+          "name": "analyze_performance_prompt",
+          "signature": "def analyze_performance_prompt(\n    file_path: str,\n    focus: list[str] | None = None,\n    include_benchmarks: bool = False,\n) -> list[Message]",
+          "parameters": "(\n    file_path: str,\n    focus: list[str] | None = None,\n    include_benchmarks: bool = False,\n)",
+          "return_type": "list[Message]",
+          "docstring": "Prompt template encouraging structured performance analysis.",
+          "decorators": [
+            "@mcp.prompt(\n    name=\"analyze_performance\",\n    description=\"Investigate performance hotspots and optimisation opportunities\",\n    tags={\"performance\", \"analysis\"},\n)"
+          ],
+          "start_line": 1000,
+          "end_line": 1034,
+          "is_async": false
+        },
+        {
+          "name": "augment_configure",
+          "signature": "def augment_configure(\n    workspace_root: str,\n    permissions: Any,\n    scope: Literal[\"user\", \"project\"] = \"project\",\n) -> str",
+          "parameters": "(\n    workspace_root: str,\n    permissions: Any,\n    scope: Literal[\"user\", \"project\"] = \"project\",\n)",
+          "return_type": "str",
+          "docstring": "Write Augment permission configuration to the appropriate settings file.",
+          "decorators": [
+            "@mcp.tool(\n    name=\"augment_configure\",\n    description=\"Configure Augment tool permissions for a workspace\",\n)"
+          ],
+          "start_line": 1041,
+          "end_line": 1069,
+          "is_async": true
+        },
+        {
+          "name": "augment_custom_command",
+          "signature": "def augment_custom_command(\n    command_name: str,\n    arguments: Sequence[str] | str | None = None,\n    workspace_root: str | None = None,\n    timeout_ms: int | None = None,\n    binary_path: str | None = None,\n    session_token: str | None = None,\n) -> str",
+          "parameters": "(\n    command_name: str,\n    arguments: Sequence[str] | str | None = None,\n    workspace_root: str | None = None,\n    timeout_ms: int | None = None,\n    binary_path: str | None = None,\n    session_token: str | None = None,\n)",
+          "return_type": "str",
+          "docstring": "Run a custom Auggie command and return its output.",
+          "decorators": [
+            "@mcp.tool(\n    name=\"augment_custom_command\",\n    description=\"Execute a custom Auggie command for reusable workflows\",\n)"
+          ],
+          "start_line": 1076,
+          "end_line": 1108,
+          "is_async": true
+        },
+        {
+          "name": "augment_list_commands",
+          "signature": "def augment_list_commands(\n    workspace_root: str | None = None,\n    timeout_ms: int | None = None,\n    binary_path: str | None = None,\n    session_token: str | None = None,\n) -> str",
+          "parameters": "(\n    workspace_root: str | None = None,\n    timeout_ms: int | None = None,\n    binary_path: str | None = None,\n    session_token: str | None = None,\n)",
+          "return_type": "str",
+          "docstring": "List registered Auggie slash commands.",
+          "decorators": [
+            "@mcp.tool(\n    name=\"augment_list_commands\",\n    description=\"List available Auggie custom commands\",\n)"
+          ],
+          "start_line": 1115,
+          "end_line": 1138,
+          "is_async": true
+        },
+        {
+          "name": "main",
+          "signature": "def main() -> None",
+          "parameters": "()",
+          "return_type": "None",
+          "docstring": "Entrypoint for running the FastMCP server over HTTP transport.",
+          "decorators": [],
+          "start_line": 1141,
+          "end_line": 1155,
+          "is_async": false
+        }
+      ],
+      "parsedAt": 1769588048336
+    },
+    "augment_mcp/telemetry.py": {
+      "path": "augment_mcp/telemetry.py",
+      "contentHash": "612a9624e62ac9da3a91d847e24035c0",
+      "mtime": 1759238628975.424,
+      "functions": [
+        {
+          "name": "reset_telemetry",
+          "signature": "def reset_telemetry() -> None",
+          "parameters": "()",
+          "return_type": "None",
+          "docstring": "Reset telemetry data (used by tests).",
+          "decorators": [],
+          "start_line": 36,
+          "end_line": 49,
+          "is_async": false
+        },
+        {
+          "name": "record_operation",
+          "signature": "def record_operation(kind: Literal[\"tool\", \"resource\", \"prompt\"], duration_ms: float) -> None",
+          "parameters": "(kind: Literal[\"tool\", \"resource\", \"prompt\"], duration_ms: float)",
+          "return_type": "None",
+          "docstring": "Record execution metrics for tools, resources, and prompts.",
+          "decorators": [],
+          "start_line": 52,
+          "end_line": 71,
+          "is_async": false
+        },
+        {
+          "name": "collect_performance_metrics",
+          "signature": "def collect_performance_metrics() -> Dict[str, Any]",
+          "parameters": "()",
+          "return_type": "Dict[str, Any]",
+          "docstring": "Return a snapshot of performance metrics and statistics.",
+          "decorators": [],
+          "start_line": 80,
+          "end_line": 115,
+          "is_async": false
+        },
+        {
+          "name": "record_auggie_run",
+          "signature": "def record_auggie_run(\n    *,\n    command: str,\n    instruction: Optional[str],\n    workspace_root: Optional[str],\n    model: Optional[str],\n    duration_ms: int,\n    success: bool,\n    output_length: int,\n    error: Optional[str],\n) -> None",
+          "parameters": "(\n    *,\n    command: str,\n    instruction: Optional[str],\n    workspace_root: Optional[str],\n    model: Optional[str],\n    duration_ms: int,\n    success: bool,\n    output_length: int,\n    error: Optional[str],\n)",
+          "return_type": "None",
+          "docstring": "Record an Auggie CLI invocation for history tracking.",
+          "decorators": [],
+          "start_line": 118,
+          "end_line": 142,
+          "is_async": false
+        },
+        {
+          "name": "collect_auggie_history",
+          "signature": "def collect_auggie_history(limit: int = 50) -> Dict[str, Any]",
+          "parameters": "(limit: int = 50)",
+          "return_type": "Dict[str, Any]",
+          "docstring": "Return recent Auggie CLI run history.",
+          "decorators": [],
+          "start_line": 145,
+          "end_line": 167,
+          "is_async": false
+        }
+      ],
+      "parsedAt": 1769588048336
+    },
+    "tests/fake_auggie.py": {
+      "path": "tests/fake_auggie.py",
+      "contentHash": "52f00dfcbfe2e850d4ad22cf135b99d2",
+      "mtime": 1759194617499.4758,
+      "functions": [
+        {
+          "name": "main",
+          "signature": "def main(argv: list[str]) -> int",
+          "parameters": "(argv: list[str])",
+          "return_type": "int",
+          "docstring": null,
+          "decorators": [],
+          "start_line": 47,
+          "end_line": 84,
+          "is_async": false
+        }
+      ],
+      "parsedAt": 1769588048336
+    }
+  }
+}

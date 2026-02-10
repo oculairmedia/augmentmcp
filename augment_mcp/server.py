@@ -6,7 +6,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import time
 from collections.abc import Awaitable, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
@@ -24,6 +27,7 @@ from .auggie import (
     run_auggie,
     run_auggie_command,
 )
+from .telemetry import collect_auggie_history, collect_performance_metrics, record_operation
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +40,18 @@ server or pass `session_token` per call.
 """
 
 mcp = FastMCP(name="augment-fastmcp", instructions=INSTRUCTIONS)
+
+
+@contextmanager
+def _metric_scope(kind: Literal["tool", "resource", "prompt"]) -> None:
+    """Record execution duration for telemetry metrics."""
+
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        duration_ms = (time.perf_counter() - start) * 1000
+        record_operation(kind, duration_ms)
 
 
 async def _load_paths(paths: Iterable[str]) -> str:
@@ -101,6 +117,215 @@ def _extract_command_metadata(text: str) -> dict[str, Any]:
     return meta
 
 
+def _safe_relative_path(path: Path, workspace: Path) -> str:
+    """Return the path relative to workspace when possible."""
+
+    try:
+        workspace_resolved = workspace.resolve()
+        return path.resolve().relative_to(workspace_resolved).as_posix()
+    except (ValueError, OSError):
+        return str(path)
+
+
+async def _gather_context_lines(
+    path: Path,
+    line_number: int,
+    context_lines: int,
+    cache: dict[Path, list[str]],
+) -> dict[str, list[str]]:
+    """Return surrounding context lines for a file and line number."""
+
+    if context_lines <= 0:
+        return {"before": [], "after": []}
+
+    lines = cache.get(path)
+    if lines is None:
+        try:
+            text = await _read_text_file(path)
+        except OSError:
+            cache[path] = []
+            lines = []
+        else:
+            lines = text.splitlines()
+            cache[path] = lines
+
+    if not lines:
+        return {"before": [], "after": []}
+
+    index = max(line_number - 1, 0)
+    before_start = max(index - context_lines, 0)
+    before = lines[before_start:index]
+    after = lines[index + 1 : index + 1 + context_lines]
+    return {"before": before, "after": after}
+
+
+async def _format_search_results(
+    matches: list[dict[str, Any]],
+    workspace: Path,
+    context_lines: int,
+) -> list[dict[str, Any]]:
+    """Format raw search matches with relative paths and context."""
+
+    if not matches:
+        return []
+
+    cache: dict[Path, list[str]] = {}
+    workspace_resolved = workspace.resolve()
+    formatted: list[dict[str, Any]] = []
+    for match in matches:
+        raw_path = Path(match["file"]).expanduser()
+        context = await _gather_context_lines(
+            raw_path, int(match["line_number"]), context_lines, cache
+        )
+        formatted.append(
+            {
+                "file": _safe_relative_path(raw_path, workspace_resolved),
+                "line_number": int(match["line_number"]),
+                "line_content": match["line_content"].rstrip("\n"),
+                "match_context": context,
+            }
+        )
+    return formatted
+
+
+def _get_search_tool() -> str:
+    """Determine which search backend is available."""
+
+    if shutil.which("rg"):
+        return "ripgrep"
+    if shutil.which("grep"):
+        return "grep"
+    return "python"
+
+
+async def _search_with_ripgrep(
+    workspace: Path,
+    query: str,
+    max_results: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Search using ripgrep returning raw matches and total count."""
+
+    cmd = ["rg", "--json", "--no-heading", query, str(workspace)]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    if process.returncode not in (0, 1):  # 1 => no matches
+        raise ResourceError(f"ripgrep failed: {stderr.decode('utf-8', 'replace').strip()}")
+
+    matches: list[dict[str, Any]] = []
+    total_matches = 0
+    for line in stdout.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if data.get("type") != "match":
+            continue
+        total_matches += 1
+        if len(matches) < max_results:
+            match_data = data["data"]
+            matches.append(
+                {
+                    "file": match_data["path"]["text"],
+                    "line_number": match_data["line_number"],
+                    "line_content": match_data["lines"]["text"],
+                }
+            )
+
+    return matches, total_matches
+
+
+async def _search_with_grep(
+    workspace: Path,
+    query: str,
+    max_results: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Search using GNU grep returning raw matches and total count."""
+
+    cmd = [
+        "grep",
+        "-R",
+        "-n",
+        "--color=never",
+        "--binary-files=without-match",
+        query,
+        str(workspace),
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    if process.returncode not in (0, 1):
+        raise ResourceError(f"grep failed: {stderr.decode('utf-8', 'replace').strip()}")
+
+    matches: list[dict[str, Any]] = []
+    total_matches = 0
+    for line in stdout.decode("utf-8", "replace").splitlines():
+        if not line.strip() or line.startswith("Binary file"):
+            continue
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        try:
+            line_number = int(parts[1])
+        except ValueError:
+            continue
+        total_matches += 1
+        if len(matches) < max_results:
+            matches.append(
+                {
+                    "file": parts[0],
+                    "line_number": line_number,
+                    "line_content": parts[2],
+                }
+            )
+
+    return matches, total_matches
+
+
+async def _search_with_python(
+    workspace: Path,
+    query: str,
+    max_results: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Fallback search implementation in pure Python."""
+
+    matches: list[dict[str, Any]] = []
+    total_matches = 0
+
+    for path in workspace.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            text = await _read_text_file(path)
+        except OSError:
+            continue
+        for index, line in enumerate(text.splitlines(), start=1):
+            if query in line:
+                total_matches += 1
+                if len(matches) < max_results:
+                    matches.append(
+                        {
+                            "file": str(path),
+                            "line_number": index,
+                            "line_content": line,
+                        }
+                    )
+                if total_matches > max_results and len(matches) >= max_results:
+                    return matches, total_matches
+
+    return matches, total_matches
 async def _execute_with_error_handling(
     call: Awaitable[AuggieRunResult],
     *,
@@ -147,60 +372,64 @@ async def _execute_with_error_handling(
 async def get_capabilities() -> dict[str, Any]:
     """Expose high-level information about registered MCP interfaces."""
 
-    tools = await mcp.get_tools()
-    prompts = await mcp.get_prompts()
-    resource_templates = await mcp.get_resource_templates()
+    with _metric_scope("resource"):
+        tools = await mcp.get_tools()
+        prompts = await mcp.get_prompts()
+        resource_templates = await mcp.get_resource_templates()
 
-    tool_entries = [
-        {
-            "name": name,
-            "description": tool.description,
-            "enabled": tool.enabled,
+        tool_entries = [
+            {
+                "name": name,
+                "description": tool.description,
+                "enabled": tool.enabled,
+            }
+            for name, tool in sorted(tools.items())
+        ]
+
+        prompt_entries = [
+            {
+                "name": name,
+                "description": prompt.description,
+                "tags": sorted(prompt.tags),
+                "enabled": prompt.enabled,
+            }
+            for name, prompt in sorted(prompts.items())
+        ]
+
+        resource_entries = [
+            {
+                "uri": uri,
+                "name": template.name,
+                "description": template.description,
+            }
+            for uri, template in sorted(resource_templates.items())
+        ]
+
+        features = {
+            "workspace_indexing": True,
+            "custom_commands": True,
+            "tool_permissions": True,
+            "mcp_resources": True,
+            "mcp_prompts": True,
+            "workspace_search": True,
+            "run_history": True,
+            "performance_metrics": True,
         }
-        for name, tool in sorted(tools.items())
-    ]
 
-    prompt_entries = [
-        {
-            "name": name,
-            "description": prompt.description,
-            "tags": sorted(prompt.tags),
-            "enabled": prompt.enabled,
+        supported_models = [
+            "claude-sonnet-4",
+            "claude-sonnet-3.5",
+            "gpt-4o",
+            "gpt-4o-mini",
+        ]
+
+        return {
+            "tools": tool_entries,
+            "prompts": prompt_entries,
+            "resources": resource_entries,
+            "features": features,
+            "supported_models": supported_models,
         }
-        for name, prompt in sorted(prompts.items())
-    ]
-
-    resource_entries = [
-        {
-            "uri": uri,
-            "name": template.name,
-            "description": template.description,
-        }
-        for uri, template in sorted(resource_templates.items())
-    ]
-
-    features = {
-        "workspace_indexing": True,
-        "custom_commands": True,
-        "tool_permissions": True,
-        "mcp_resources": True,
-        "mcp_prompts": True,
-    }
-
-    supported_models = [
-        "claude-sonnet-4",
-        "claude-sonnet-3.5",
-        "gpt-4o",
-        "gpt-4o-mini",
-    ]
-
-    return {
-        "tools": tool_entries,
-        "prompts": prompt_entries,
-        "resources": resource_entries,
-        "features": features,
-        "supported_models": supported_models,
-    }
 
 
 @mcp.resource(
@@ -213,28 +442,29 @@ async def get_capabilities() -> dict[str, Any]:
 async def get_workspace_settings(workspace_path: str) -> dict[str, Any]:
     """Expose Augment settings for the provided workspace."""
 
-    workspace = _expand_workspace(workspace_path)
-    settings_path = workspace / ".augment" / "settings.json"
+    with _metric_scope("resource"):
+        workspace = _expand_workspace(workspace_path)
+        settings_path = workspace / ".augment" / "settings.json"
 
-    if not settings_path.exists():
+        if not settings_path.exists():
+            return {
+                "workspace": str(workspace),
+                "settings_file": str(settings_path),
+                "exists": False,
+            }
+
+        try:
+            data = await _read_json_file(settings_path)
+        except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover - rare IO errors
+            raise ResourceError(f"Failed to read workspace settings: {exc}") from exc
+
         return {
             "workspace": str(workspace),
             "settings_file": str(settings_path),
-            "exists": False,
+            "exists": True,
+            "tool_permissions": data.get("tool-permissions", []),
+            "settings": data,
         }
-
-    try:
-        data = await _read_json_file(settings_path)
-    except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover - rare IO errors
-        raise ResourceError(f"Failed to read workspace settings: {exc}") from exc
-
-    return {
-        "workspace": str(workspace),
-        "settings_file": str(settings_path),
-        "exists": True,
-        "tool_permissions": data.get("tool-permissions", []),
-        "settings": data,
-    }
 
 
 async def _collect_command_entries(root: Path, scope: str) -> list[dict[str, Any]]:
@@ -279,21 +509,22 @@ async def _collect_command_entries(root: Path, scope: str) -> list[dict[str, Any
 async def get_custom_commands(workspace_path: str) -> dict[str, Any]:
     """Enumerate workspace and user-level Augment command files."""
 
-    workspace = _expand_workspace(workspace_path)
-    workspace_commands = await _collect_command_entries(
-        workspace / ".augment" / "commands", scope="workspace"
-    )
-    user_commands = await _collect_command_entries(
-        Path.home() / ".augment" / "commands", scope="user"
-    )
+    with _metric_scope("resource"):
+        workspace = _expand_workspace(workspace_path)
+        workspace_commands = await _collect_command_entries(
+            workspace / ".augment" / "commands", scope="workspace"
+        )
+        user_commands = await _collect_command_entries(
+            Path.home() / ".augment" / "commands", scope="user"
+        )
 
-    commands = workspace_commands + user_commands
+        commands = workspace_commands + user_commands
 
-    return {
-        "workspace": str(workspace),
-        "total": len(commands),
-        "commands": commands,
-    }
+        return {
+            "workspace": str(workspace),
+            "total": len(commands),
+            "commands": commands,
+        }
 
 
 @mcp.resource(
@@ -309,17 +540,18 @@ async def get_workspace_tree(
 ) -> dict[str, Any]:
     """Return a truncated directory tree for the workspace."""
 
-    workspace = _expand_workspace(workspace_path)
-    depth = max_depth if max_depth is not None else 3
-    depth = max(depth, 0)
+    with _metric_scope("resource"):
+        workspace = _expand_workspace(workspace_path)
+        depth = max_depth if max_depth is not None else 3
+        depth = max(depth, 0)
 
-    loop = asyncio.get_running_loop()
-    try:
-        tree = await loop.run_in_executor(None, _build_tree_sync, workspace, depth)
-    except OSError as exc:  # pragma: no cover - permission issues
-        raise ResourceError(f"Failed to walk workspace: {exc}") from exc
+        loop = asyncio.get_running_loop()
+        try:
+            tree = await loop.run_in_executor(None, _build_tree_sync, workspace, depth)
+        except OSError as exc:  # pragma: no cover - permission issues
+            raise ResourceError(f"Failed to walk workspace: {exc}") from exc
 
-    return tree
+        return tree
 
 
 @mcp.resource(
@@ -332,25 +564,26 @@ async def get_workspace_tree(
 async def get_index_status(workspace_path: str) -> dict[str, Any]:
     """Read Augment index status metadata when available."""
 
-    workspace = _expand_workspace(workspace_path)
-    status_path = workspace / ".augment" / "index" / "status.json"
+    with _metric_scope("resource"):
+        workspace = _expand_workspace(workspace_path)
+        status_path = workspace / ".augment" / "index" / "status.json"
 
-    if not status_path.exists():
-        return {
-            "workspace": str(workspace),
-            "status_file": str(status_path),
-            "indexed": False,
-            "message": "Index status file not found",
-        }
+        if not status_path.exists():
+            return {
+                "workspace": str(workspace),
+                "status_file": str(status_path),
+                "indexed": False,
+                "message": "Index status file not found",
+            }
 
-    try:
-        data = await _read_json_file(status_path)
-    except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover - read errors
-        raise ResourceError(f"Failed to read index status: {exc}") from exc
+        try:
+            data = await _read_json_file(status_path)
+        except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover - read errors
+            raise ResourceError(f"Failed to read index status: {exc}") from exc
 
-    data.setdefault("workspace", str(workspace))
-    data.setdefault("status_file", str(status_path))
-    return data
+        data.setdefault("workspace", str(workspace))
+        data.setdefault("status_file", str(status_path))
+        return data
 
 
 @mcp.resource(
@@ -366,29 +599,30 @@ async def get_command_details(
 ) -> dict[str, Any]:
     """Return command metadata and body for a specific command name."""
 
-    workspace = _expand_workspace(workspace_path)
-    candidates = _iter_command_candidates(workspace, command_name)
+    with _metric_scope("resource"):
+        workspace = _expand_workspace(workspace_path)
+        candidates = _iter_command_candidates(workspace, command_name)
 
-    if not candidates:
-        raise ResourceError(
-            f"Command '{command_name}' not found in workspace or user commands"
-        )
+        if not candidates:
+            raise ResourceError(
+                f"Command '{command_name}' not found in workspace or user commands"
+            )
 
-    scope, path = candidates[0]
-    try:
-        raw = await _read_text_file(path)
-    except OSError as exc:  # pragma: no cover - file permissions
-        raise ResourceError(f"Failed to read command '{command_name}': {exc}") from exc
+        scope, path = candidates[0]
+        try:
+            raw = await _read_text_file(path)
+        except OSError as exc:  # pragma: no cover - file permissions
+            raise ResourceError(f"Failed to read command '{command_name}': {exc}") from exc
 
-    meta = _extract_command_metadata(raw)
+        meta = _extract_command_metadata(raw)
 
-    return {
-        "name": command_name,
-        "scope": scope,
-        "path": str(path),
-        "meta": meta,
-        "content": raw,
-    }
+        return {
+            "name": command_name,
+            "scope": scope,
+            "path": str(path),
+            "meta": meta,
+            "content": raw,
+        }
 
 
 def _iter_command_candidates(workspace: Path, command_name: str) -> list[tuple[str, Path]]:
@@ -435,6 +669,98 @@ def _build_tree_sync(root: Path, max_depth: int) -> dict[str, Any]:
     return walk(root, 0)
 
 
+@mcp.resource(
+    "augment://workspace/{workspace_path}/search",
+    name="Augment Workspace Search",
+    description="Search workspace files for a query string",
+    mime_type="application/json",
+    annotations={"readOnlyHint": True, "idempotentHint": False},
+)
+async def search_workspace(
+    workspace_path: str,
+    query: str | None = None,
+    max_results: int = 20,
+    context_lines: int = 2,
+) -> dict[str, Any]:
+    """Search workspace files using ripgrep, grep, or a Python fallback."""
+
+    with _metric_scope("resource"):
+        workspace = _expand_workspace(workspace_path)
+        if not workspace.exists() or not workspace.is_dir():
+            raise ResourceError(f"Workspace not found: {workspace_path}")
+
+        if query is None:
+            raise ResourceError("query parameter is required")
+
+        query = query.strip()
+        if not query:
+            raise ResourceError("query must not be empty")
+
+        if max_results <= 0:
+            raise ResourceError("max_results must be greater than zero")
+
+        tool = _get_search_tool()
+        if tool == "ripgrep":
+            raw_matches, total_matches = await _search_with_ripgrep(
+                workspace, query, max_results
+            )
+        elif tool == "grep":
+            raw_matches, total_matches = await _search_with_grep(
+                workspace, query, max_results
+            )
+        else:
+            raw_matches, total_matches = await _search_with_python(
+                workspace, query, max_results
+            )
+            tool = "python"
+
+        formatted_matches = await _format_search_results(
+            raw_matches, workspace, context_lines
+        )
+
+        return {
+            "workspace": str(workspace),
+            "query": query,
+            "total_matches": total_matches,
+            "max_results": max_results,
+            "search_tool": tool,
+            "results": formatted_matches,
+            "truncated": total_matches > len(formatted_matches),
+        }
+
+
+@mcp.resource(
+    "augment://history/{scope}/runs",
+    name="Auggie Run History",
+    description="Recent Auggie CLI invocations and their results",
+    mime_type="application/json",
+    annotations={"readOnlyHint": True, "idempotentHint": False},
+)
+async def get_auggie_history(scope: str = "global", limit: int = 50) -> dict[str, Any]:
+    """Return recent Auggie execution history."""
+
+    with _metric_scope("resource"):
+        payload = collect_auggie_history(limit)
+        payload["scope"] = scope
+        return payload
+
+
+@mcp.resource(
+    "augment://metrics/{scope}/performance",
+    name="Performance Metrics",
+    description="Server performance metrics and aggregated statistics",
+    mime_type="application/json",
+    annotations={"readOnlyHint": True, "idempotentHint": True},
+)
+async def get_performance_metrics(scope: str = "server") -> dict[str, Any]:
+    """Expose telemetry metrics collected by the server."""
+
+    with _metric_scope("resource"):
+        payload = collect_performance_metrics()
+        payload["scope"] = scope
+        return payload
+
+
 @mcp.tool(name="augment_review", description="Use Auggie to review artifacts with Augment context engine")
 async def augment_review(
     instruction: str,
@@ -451,30 +777,31 @@ async def augment_review(
 ) -> str:
     """Invoke Auggie CLI with the provided instruction and context."""
 
-    path_context = ""
-    if paths:
-        path_context = await _load_paths(paths)
+    with _metric_scope("tool"):
+        path_context = ""
+        if paths:
+            path_context = await _load_paths(paths)
 
-    combined_context_parts = [part for part in (path_context, context) if part]
-    combined_context = "\n\n".join(combined_context_parts) if combined_context_parts else None
+        combined_context_parts = [part for part in (path_context, context) if part]
+        combined_context = "\n\n".join(combined_context_parts) if combined_context_parts else None
 
-    timeout_seconds = timeout_ms / 1000 if timeout_ms is not None else None
+        timeout_seconds = timeout_ms / 1000 if timeout_ms is not None else None
 
-    return await _execute_with_error_handling(
-        run_auggie(
-            instruction=instruction,
-            input_text=combined_context,
+        return await _execute_with_error_handling(
+            run_auggie(
+                instruction=instruction,
+                input_text=combined_context,
+                workspace_root=workspace_root,
+                model=model,
+                compact=compact,
+                github_api_token=github_api_token,
+                extra_args=extra_args,
+                timeout_seconds=timeout_seconds,
+                session_token=session_token,
+                binary_path=binary_path,
+            ),
             workspace_root=workspace_root,
-            model=model,
-            compact=compact,
-            github_api_token=github_api_token,
-            extra_args=extra_args,
-            timeout_seconds=timeout_seconds,
-            session_token=session_token,
-            binary_path=binary_path,
-        ),
-        workspace_root=workspace_root,
-    )
+        )
 
 
 @mcp.prompt(
@@ -489,26 +816,27 @@ def security_review_prompt(
 ) -> list[dict[str, Any]]:
     """Prompt template for requesting a security-focused review."""
 
-    focus_map = {
-        "all": [
-            "SQL injection and parameterized queries",
-            "Cross-site scripting and output encoding",
-            "Authentication and authorization controls",
-            "Cryptography usage and key management",
-            "Input validation and sanitisation",
-            "Error handling and information disclosure",
-            "Secure coding best practices",
-        ],
-        "sql-injection": ["SQL injection vulnerabilities", "Use of parameterized queries"],
-        "xss": ["Cross-site scripting", "Output encoding of untrusted data"],
-        "auth": ["Authentication checks", "Authorization logic", "Session management"],
-        "crypto": ["Cryptographic primitives", "Key management", "Secure randomness"],
-    }
+    with _metric_scope("prompt"):
+        focus_map = {
+            "all": [
+                "SQL injection and parameterized queries",
+                "Cross-site scripting and output encoding",
+                "Authentication and authorization controls",
+                "Cryptography usage and key management",
+                "Input validation and sanitisation",
+                "Error handling and information disclosure",
+                "Secure coding best practices",
+            ],
+            "sql-injection": ["SQL injection vulnerabilities", "Use of parameterized queries"],
+            "xss": ["Cross-site scripting", "Output encoding of untrusted data"],
+            "auth": ["Authentication checks", "Authorization logic", "Session management"],
+            "crypto": ["Cryptographic primitives", "Key management", "Secure randomness"],
+        }
 
-    areas = focus_map.get(focus_areas, focus_map["all"])
-    bullet_list = "\n".join(f"- {item}" for item in areas)
+        areas = focus_map.get(focus_areas, focus_map["all"])
+        bullet_list = "\n".join(f"- {item}" for item in areas)
 
-    content = f"""Please perform a comprehensive security review of `{file_path}`.
+        content = f"""Please perform a comprehensive security review of `{file_path}`.
 
 Focus on the following areas:
 {bullet_list}
@@ -522,7 +850,7 @@ Report findings with severity **{severity_threshold}** or higher. For each issue
 
 Use the workspace context to identify related risks in neighbouring modules and ensure recommendations align with existing project patterns."""
 
-    return [Message(role="user", content=content)]
+        return [Message(role="user", content=content)]
 
 
 @mcp.prompt(
@@ -537,26 +865,27 @@ def refactor_code_prompt(
 ) -> list[Message]:
     """Prompt template for structured refactoring guidance."""
 
-    goal_catalog = {
-        "readability": "Improve clarity and naming consistency",
-        "performance": "Optimise hot paths and resource usage",
-        "testability": "Enable easier unit testing with seams and dependency injection",
-        "maintainability": "Simplify structure to reduce long-term maintenance cost",
-        "modularity": "Increase separation of concerns and reuse",
-    }
+    with _metric_scope("prompt"):
+        goal_catalog = {
+            "readability": "Improve clarity and naming consistency",
+            "performance": "Optimise hot paths and resource usage",
+            "testability": "Enable easier unit testing with seams and dependency injection",
+            "maintainability": "Simplify structure to reduce long-term maintenance cost",
+            "modularity": "Increase separation of concerns and reuse",
+        }
 
-    selected = goals or ["readability", "maintainability"]
-    goals_text = "\n".join(
-        f"- {goal_catalog.get(goal, goal)}" for goal in selected
-    )
+        selected = goals or ["readability", "maintainability"]
+        goals_text = "\n".join(
+            f"- {goal_catalog.get(goal, goal)}" for goal in selected
+        )
 
-    behavior_text = (
-        "Preserve the current observable behaviour unless changes are required for the goals."
-        if preserve_behavior
-        else "Minor behaviour adjustments are acceptable if they significantly improve the goals."
-    )
+        behavior_text = (
+            "Preserve the current observable behaviour unless changes are required for the goals."
+            if preserve_behavior
+            else "Minor behaviour adjustments are acceptable if they significantly improve the goals."
+        )
 
-    content = f"""Please review `{file_path}` and propose a refactoring plan.
+        content = f"""Please review `{file_path}` and propose a refactoring plan.
 
 Refactoring goals:
 {goals_text}
@@ -572,7 +901,7 @@ For each suggested change, include:
 
 Reference similar patterns in the workspace to keep the refactor aligned with existing conventions."""
 
-    return [Message(role="user", content=content)]
+        return [Message(role="user", content=content)]
 
 
 @mcp.prompt(
@@ -587,20 +916,21 @@ def generate_tests_prompt(
 ) -> list[Message]:
     """Prompt template for generating tests covering a file or module."""
 
-    style_notes = {
-        "unit": "Focus on fast, isolated unit tests that cover critical branches and edge cases.",
-        "integration": "Create integration tests exercising interactions between major components.",
-        "end-to-end": "Outline end-to-end scenarios validating real user flows.",
-    }
+    with _metric_scope("prompt"):
+        style_notes = {
+            "unit": "Focus on fast, isolated unit tests that cover critical branches and edge cases.",
+            "integration": "Create integration tests exercising interactions between major components.",
+            "end-to-end": "Outline end-to-end scenarios validating real user flows.",
+        }
 
-    style_text = style_notes.get(test_style, style_notes["unit"])
-    frameworks_note = (
-        f"Preferred frameworks or tools: {frameworks}."
-        if frameworks
-        else "Use the predominant testing frameworks already present in the workspace."
-    )
+        style_text = style_notes.get(test_style, style_notes["unit"])
+        frameworks_note = (
+            f"Preferred frameworks or tools: {frameworks}."
+            if frameworks
+            else "Use the predominant testing frameworks already present in the workspace."
+        )
 
-    content = f"""Generate a suite of {test_style} tests for `{file_path}`.
+        content = f"""Generate a suite of {test_style} tests for `{file_path}`.
 
 {style_text}
 {frameworks_note}
@@ -614,7 +944,7 @@ The output should include:
 
 Leverage project conventions and existing helpers when proposing the tests."""
 
-    return [Message(role="user", content=content)]
+        return [Message(role="user", content=content)]
 
 
 @mcp.prompt(
@@ -629,20 +959,21 @@ def api_design_review_prompt(
 ) -> list[Message]:
     """Prompt template for API design analysis."""
 
-    type_notes = {
-        "REST": "Assess resource modelling, HTTP verb usage, status codes, and pagination.",
-        "GRAPHQL": "Evaluate schema design, query complexity, resolver patterns, and caching strategies.",
-        "GRPC": "Review service definitions, streaming usage, compatibility, and error handling.",
-    }
+    with _metric_scope("prompt"):
+        type_notes = {
+            "REST": "Assess resource modelling, HTTP verb usage, status codes, and pagination.",
+            "GRAPHQL": "Evaluate schema design, query complexity, resolver patterns, and caching strategies.",
+            "GRPC": "Review service definitions, streaming usage, compatibility, and error handling.",
+        }
 
-    focus_note = type_notes.get(api_type.upper(), type_notes["REST"])
-    guidelines_note = (
-        f"Follow the documented guidelines: {guidelines}."
-        if guidelines
-        else "Reference existing project API standards and established industry guidelines."
-    )
+        focus_note = type_notes.get(api_type.upper(), type_notes["REST"])
+        guidelines_note = (
+            f"Follow the documented guidelines: {guidelines}."
+            if guidelines
+            else "Reference existing project API standards and established industry guidelines."
+        )
 
-    content = f"""Review the API implementation in `{file_path}`.
+        content = f"""Review the API implementation in `{file_path}`.
 
 API style: {api_type}
 {focus_note}
@@ -658,7 +989,7 @@ For the review, cover:
 
 Compare this API with existing endpoints in the workspace to maintain consistency."""
 
-    return [Message(role="user", content=content)]
+        return [Message(role="user", content=content)]
 
 
 @mcp.prompt(
@@ -673,15 +1004,18 @@ def analyze_performance_prompt(
 ) -> list[Message]:
     """Prompt template encouraging structured performance analysis."""
 
-    focus_items = focus or ["cpu", "memory"]
-    focus_text = "\n".join(f"- {item.title()} usage and bottlenecks" for item in focus_items)
-    benchmark_note = (
-        "Include benchmark scenarios and target metrics for the proposed optimisations."
-        if include_benchmarks
-        else "Call out relevant metrics or profiling tools without drafting full benchmarks."
-    )
+    with _metric_scope("prompt"):
+        focus_items = focus or ["cpu", "memory"]
+        focus_text = "\n".join(
+            f"- {item.title()} usage and bottlenecks" for item in focus_items
+        )
+        benchmark_note = (
+            "Include benchmark scenarios and target metrics for the proposed optimisations."
+            if include_benchmarks
+            else "Call out relevant metrics or profiling tools without drafting full benchmarks."
+        )
 
-    content = f"""Analyse performance characteristics of `{file_path}`.
+        content = f"""Analyse performance characteristics of `{file_path}`.
 
 Primary focus areas:
 {focus_text}
@@ -697,7 +1031,7 @@ Provide:
 
 Use workspace context (profiling data, comparable modules, configuration) to ground the analysis."""
 
-    return [Message(role="user", content=content)]
+        return [Message(role="user", content=content)]
 
 
 @mcp.tool(
@@ -711,27 +1045,28 @@ async def augment_configure(
 ) -> str:
     """Write Augment permission configuration to the appropriate settings file."""
 
-    if scope not in {"user", "project"}:
-        raise ToolError("scope must be either 'user' or 'project'")
+    with _metric_scope("tool"):
+        if scope not in {"user", "project"}:
+            raise ToolError("scope must be either 'user' or 'project'")
 
-    if scope == "project":
-        settings_root = Path(workspace_root).expanduser()
-        if not settings_root.exists():
-            raise ToolError(f"Workspace root does not exist: {workspace_root}")
-        settings_path = settings_root / ".augment" / "settings.json"
-    else:
-        settings_path = Path.home() / ".augment" / "settings.json"
+        if scope == "project":
+            settings_root = Path(workspace_root).expanduser()
+            if not settings_root.exists():
+                raise ToolError(f"Workspace root does not exist: {workspace_root}")
+            settings_path = settings_root / ".augment" / "settings.json"
+        else:
+            settings_path = Path.home() / ".augment" / "settings.json"
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
 
-    config = {"tool-permissions": permissions}
+        config = {"tool-permissions": permissions}
 
-    try:
-        settings_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:  # pragma: no cover - filesystem errors
-        raise ToolError(f"Failed to write settings: {exc}") from exc
+        try:
+            settings_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - filesystem errors
+            raise ToolError(f"Failed to write settings: {exc}") from exc
 
-    return f"Configured tool permissions at {settings_path}"
+        return f"Configured tool permissions at {settings_path}"
 
 
 @mcp.tool(
@@ -748,28 +1083,29 @@ async def augment_custom_command(
 ) -> str:
     """Run a custom Auggie command and return its output."""
 
-    arg_list: list[str] = ["command", command_name]
+    with _metric_scope("tool"):
+        arg_list: list[str] = ["command", command_name]
 
-    if arguments:
-        if isinstance(arguments, str):
-            arg_list.append(arguments)
-        else:
-            arg_list.extend(arguments)
+        if arguments:
+            if isinstance(arguments, str):
+                arg_list.append(arguments)
+            else:
+                arg_list.extend(arguments)
 
-    if workspace_root:
-        arg_list.extend(["--workspace-root", workspace_root])
+        if workspace_root:
+            arg_list.extend(["--workspace-root", workspace_root])
 
-    timeout_seconds = timeout_ms / 1000 if timeout_ms is not None else None
+        timeout_seconds = timeout_ms / 1000 if timeout_ms is not None else None
 
-    return await _execute_with_error_handling(
-        run_auggie_command(
-            args=arg_list,
-            timeout_seconds=timeout_seconds,
-            session_token=session_token,
-            binary_path=binary_path,
-        ),
-        workspace_root=workspace_root,
-    )
+        return await _execute_with_error_handling(
+            run_auggie_command(
+                args=arg_list,
+                timeout_seconds=timeout_seconds,
+                session_token=session_token,
+                binary_path=binary_path,
+            ),
+            workspace_root=workspace_root,
+        )
 
 
 @mcp.tool(
@@ -784,21 +1120,22 @@ async def augment_list_commands(
 ) -> str:
     """List registered Auggie slash commands."""
 
-    args = ["command", "list"]
-    if workspace_root:
-        args.extend(["--workspace-root", workspace_root])
+    with _metric_scope("tool"):
+        args = ["command", "list"]
+        if workspace_root:
+            args.extend(["--workspace-root", workspace_root])
 
-    timeout_seconds = timeout_ms / 1000 if timeout_ms is not None else None
+        timeout_seconds = timeout_ms / 1000 if timeout_ms is not None else None
 
-    return await _execute_with_error_handling(
-        run_auggie_command(
-            args=args,
-            timeout_seconds=timeout_seconds,
-            session_token=session_token,
-            binary_path=binary_path,
-        ),
-        workspace_root=workspace_root,
-    )
+        return await _execute_with_error_handling(
+            run_auggie_command(
+                args=args,
+                timeout_seconds=timeout_seconds,
+                session_token=session_token,
+                binary_path=binary_path,
+            ),
+            workspace_root=workspace_root,
+        )
 
 
 def main() -> None:

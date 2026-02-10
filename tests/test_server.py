@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ResourceError, ToolError
 
 from augment_mcp.auggie import run_auggie
 from augment_mcp.server import (
@@ -25,14 +25,18 @@ from augment_mcp.server import (
     augment_review,
     generate_tests_prompt,
     get_capabilities,
+    get_auggie_history,
     get_command_details,
     get_custom_commands,
     get_index_status,
+    get_performance_metrics,
     get_workspace_settings,
     get_workspace_tree,
+    search_workspace,
     refactor_code_prompt,
     security_review_prompt,
 )
+from augment_mcp.telemetry import reset_telemetry
 
 
 class AugmentServerTests(unittest.IsolatedAsyncioTestCase):
@@ -48,6 +52,8 @@ class AugmentServerTests(unittest.IsolatedAsyncioTestCase):
         self._previous_path = os.environ.get("AUGGIE_PATH")
         os.environ["AUGGIE_PATH"] = str(self.fake_cli)
         self.addCleanup(self._restore_env)
+
+        reset_telemetry()
 
     def _restore_env(self) -> None:
         if self._previous_path is None:
@@ -248,10 +254,17 @@ class AugmentServerTests(unittest.IsolatedAsyncioTestCase):
         tool_names = {tool["name"] for tool in capabilities["tools"]}
         prompt_names = {prompt["name"] for prompt in capabilities["prompts"]}
         resource_uris = {res["uri"] for res in capabilities["resources"]}
+        features = capabilities["features"]
 
         self.assertIn("augment_review", tool_names)
         self.assertIn("security_review", prompt_names)
         self.assertIn("augment://workspace/{workspace_path}/settings", resource_uris)
+        self.assertIn("augment://workspace/{workspace_path}/search", resource_uris)
+        self.assertIn("augment://history/{scope}/runs", resource_uris)
+        self.assertIn("augment://metrics/{scope}/performance", resource_uris)
+        self.assertTrue(features["workspace_search"])
+        self.assertTrue(features["run_history"])
+        self.assertTrue(features["performance_metrics"])
 
     async def test_security_review_prompt_renders_template(self) -> None:
         messages = await security_review_prompt.render(
@@ -323,6 +336,69 @@ class AugmentServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("io", lowered)
         self.assertIn("benchmark", lowered)
 
+    async def test_workspace_search_resource_finds_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            target = workspace / "src" / "auth.py"
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                "# authentication module\n\ndef authenticate_user(username, password):\n    return True\n",
+                encoding="utf-8",
+            )
+
+            result = await search_workspace.read(
+                {
+                    "workspace_path": str(workspace),
+                    "query": "authenticate_user",
+                    "max_results": 5,
+                }
+            )
+
+        self.assertGreaterEqual(result["total_matches"], 1)
+        self.assertFalse(result["results"] == [])
+        entry = result["results"][0]
+        self.assertIn("auth.py", entry["file"])
+        self.assertIn("authenticate_user", entry["line_content"])
+
+    async def test_workspace_search_invalid_workspace_raises(self) -> None:
+        with self.assertRaises(ResourceError):
+            await search_workspace.read(
+                {"workspace_path": "/nonexistent/workspace", "query": "text"}
+            )
+
+    async def test_auggie_history_resource_records_runs(self) -> None:
+        await run_auggie(
+            instruction="History check",
+            input_text="",
+            workspace_root="/workspace/project",
+        )
+
+        history = await get_auggie_history.read({"scope": "global", "limit": 5})
+        self.assertGreaterEqual(history["total_runs"], 1)
+        self.assertLessEqual(len(history["runs"]), 5)
+        self.assertEqual(history["scope"], "global")
+        last = history["runs"][-1]
+        self.assertIn("command", last)
+        self.assertTrue(last["command"])
+        self.assertEqual(last["workspace_root"], "/workspace/project")
+
+    async def test_performance_metrics_resource_tracks_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            await get_workspace_settings.read({"workspace_path": tmp_dir})
+
+        await security_review_prompt.render(
+            {"file_path": "src/demo.py", "focus_areas": "all"}
+        )
+
+        await augment_list_commands.fn(workspace_root="/workspace/project")
+
+        metrics = await get_performance_metrics.read({"scope": "server"})
+
+        self.assertEqual(metrics["scope"], "server")
+
+        self.assertGreaterEqual(metrics["requests"]["total_resources_read"], 1)
+        self.assertGreaterEqual(metrics["requests"]["total_prompts_requested"], 1)
+        self.assertGreaterEqual(metrics["requests"]["total_tools_called"], 1)
 
 if __name__ == "__main__":
     unittest.main()
